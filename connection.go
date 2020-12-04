@@ -39,21 +39,25 @@ func (t *Connection) Open() error {
 	return nil
 }
 
-// func Connect(host, user, passwd string, options Options, authMethod string) (*Connection, error) {
+func Connect(host, user, passwd string, options Options, authMethod string) (interface{}, error) {
 
-// 	if authMethod == HIVESASL {
-// 		con, err := connectWithUser(host, user, passwd, options)
-// 		if err != nil {
-// 			return nil, err
-// 		}
-// 		return con, nil
-// 	}
-// 	if authMethod == HIVENOSASL {
+	if authMethod == HIVENOSASL {
+		con, err := ConnectWithUser(host, user, passwd, options)
+		if err != nil {
+			return nil, err
+		}
+		return con, nil
+	}
+	if authMethod == HIVESASL {
+		con, err := ConnectWithSasl(host, user, passwd, options)
+		if err != nil {
+			return nil, err
+		}
+		return con, nil
+	}
+	return nil, nil
 
-// 	}
-// 	return nil, nil
-
-// }
+}
 
 // //this func used as nosasl with sqlstdauth
 // func ConnectWithUser(host, user, passwd string, options Options) (*Connection, error) {
@@ -102,9 +106,6 @@ func ConnectWithUser(host, user, passwd string, options Options) (*Connection, e
 
 	req.Username = &user
 	req.Password = &passwd
-	fmt.Println("%+v", *client)
-	fmt.Println("req")
-	fmt.Println(req)
 	session, err := client.OpenSession(req)
 	if err != nil {
 		return nil, err
