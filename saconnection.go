@@ -5,6 +5,7 @@ package gohive
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 
 	"errors"
 	"fmt"
@@ -12,75 +13,47 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/emersion/go-sasl"
 	inf "github.com/uxff/gohive/tcliservice"
 
 	//"git.apache.org/thrift.git/lib/go/thrift"
 	"github.com/apache/thrift/lib/go/thrift"
 )
 
-type Connection struct {
+type SConnection struct {
 	*thrift.TSocket
-	thrift  *inf.TCLIServiceClient
-	session *inf.TSessionHandle
-	// SaslClientFactory sasl.Client
-	// SaslClient        sasl.Client
-	options     Options
-	Ctx         context.Context
-	WriteBuffer *bytes.Buffer
-	ReadBuffer  *bytes.Buffer
-	opened      bool
+	thrift            *inf.TCLIServiceClient
+	session           *inf.TSessionHandle
+	SaslClientFactory sasl.Client
+	SaslClient        sasl.Client
+	options           Options
+	Ctx               context.Context
+	WriteBuffer       *bytes.Buffer
+	ReadBuffer        *bytes.Buffer
+	opened            bool
 }
 
 // IsOpen returns if client is opened
-func (t *Connection) IsOpen() bool {
+func (t *SConnection) IsOpen() bool {
 	return t.opened
 }
-func (t *Connection) Open() error {
+func (t *SConnection) Open() error {
 	return nil
 }
 
-// func Connect(host, user, passwd string, options Options, authMethod string) (*Connection, error) {
-
-// 	if authMethod == HIVESASL {
-// 		con, err := connectWithUser(host, user, passwd, options)
-// 		if err != nil {
-// 			return nil, err
-// 		}
-// 		return con, nil
-// 	}
-// 	if authMethod == HIVENOSASL {
-
-// 	}
-// 	return nil, nil
-
-// }
-
-// //this func used as nosasl with sqlstdauth
-// func ConnectWithUser(host, user, passwd string, options Options) (*Connection, error) {
-// 	con, err := Connect(host, user, passwd, options, HIVENOSASL)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	return con, nil
-// }
-
-// //this func used as sasl with plain
-// func ConnectWithSasl(host, user, passwd string, options Options) (*Connection, error) {
-// 	con, err := Connect(host, user, passwd, options, HIVESASL)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	return con, nil
-// }
-
-func ConnectWithUser(host, user, passwd string, options Options) (*Connection, error) {
-	con := &Connection{
+func ConnectWithSasl(host, user, passwd string, options Options) (*SConnection, error) {
+	con := &SConnection{
 		Ctx:         context.Background(),
 		ReadBuffer:  new(bytes.Buffer),
 		WriteBuffer: new(bytes.Buffer),
 	}
 
 	//-----------------------------------
+	var saslClient sasl.Client
+	var issasl bool
+
+	saslClient = sasl.NewPlainClient("", user, passwd)
+	issasl = true
 
 	tsock, err := thrift.NewTSocket(host)
 	if err != nil {
@@ -98,7 +71,42 @@ func ConnectWithUser(host, user, passwd string, options Options) (*Connection, e
 
 	req := inf.NewTOpenSessionReq()
 	//-------------------------------------------------------------
-	req.ClientProtocol = inf.TProtocolVersion_HIVE_CLI_SERVICE_PROTOCOL_V7
+
+	if issasl && saslClient != nil {
+		mech, ir, err := saslClient.Start()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := con.sendMessage(START, []byte(mech)); err != nil {
+			return nil, err
+		}
+
+		if _, err := con.sendMessage(OK, ir); err != nil {
+			return nil, err
+		}
+		for {
+			status, payload, err := con.recvMessage()
+			if err != nil {
+				return nil, err
+			}
+			if status != OK && status != COMPLETE {
+				return nil, errors.New(fmt.Sprintf("Bad status:%d %s", status, string(payload)))
+			}
+
+			if status == COMPLETE {
+				break
+			}
+
+			response, err := saslClient.Next(payload)
+			if err != nil {
+				return nil, err
+			}
+			con.sendMessage(OK, response)
+		}
+	}
+	// //-----------------------------------------------------------------
+
+	req.ClientProtocol = inf.TProtocolVersion_HIVE_CLI_SERVICE_PROTOCOL_V10
 
 	req.Username = &user
 	req.Password = &passwd
@@ -115,139 +123,57 @@ func ConnectWithUser(host, user, passwd string, options Options) (*Connection, e
 	return con, nil
 }
 
-// func connectWithSasl(host, user, passwd string, options Options) (*Connection, error) {
-// 	con := &Connection{
-// 		Ctx:         context.Background(),
-// 		ReadBuffer:  new(bytes.Buffer),
-// 		WriteBuffer: new(bytes.Buffer),
-// 	}
+// Write writes data into local buffer, which will be processed on Flush() called
+func (t *SConnection) Write(data []byte) (int, error) {
 
-// 	//-----------------------------------
-// 	var saslClient sasl.Client
-// 	var issasl bool
+	return t.WriteBuffer.Write(data)
+} // Read reads data from local buffer, will read a new data frame if needed.
+func (t *SConnection) Read(buf []byte) (int, error) {
 
-// 	saslClient = sasl.NewPlainClient("", user, passwd)
-// 	issasl = true
+	n, err := t.ReadBuffer.Read(buf)
+	if n > 0 {
+		return n, err
+	}
+	t.ReadFrame()
+	return t.ReadBuffer.Read(buf)
+}
+func (t *SConnection) Flush() error {
+	length := make([]byte, 4)
+	binary.BigEndian.PutUint32(length, uint32(t.WriteBuffer.Len()))
 
-// 	tsock, err := thrift.NewTSocket(host)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	con.TSocket = tsock
-// 	if err := con.TSocket.Open(); err != nil {
-// 		return nil, err
-// 	}
-// 	if con.TSocket == nil {
-// 		return nil, errors.New("nil thrift transport")
-// 	}
-// 	protocol := thrift.NewTBinaryProtocolFactoryDefault()
-// 	client := inf.NewTCLIServiceClientFactory(con, protocol)
+	frame := make([]byte, 0)
+	frame = append(frame, length...)
+	frame = append(frame, t.WriteBuffer.Bytes()...)
+	_, err := t.TSocket.Write(frame)
+	if err == nil {
+		t.WriteBuffer = new(bytes.Buffer)
+		return nil
+	}
+	return err
+}
+func (t *SConnection) ReadFrame() error {
+	header := make([]byte, 4)
+	_, err := t.TSocket.Read(header)
+	if err != nil {
+		return err
+	}
+	length := int(binary.BigEndian.Uint32(header))
+	data := make([]byte, length)
+	_, err = t.TSocket.Read(data)
+	if err != nil {
+		return err
+	}
+	_, err = t.ReadBuffer.Write(data)
+	return err
+}
 
-// 	req := inf.NewTOpenSessionReq()
-// 	//-------------------------------------------------------------
-
-// 	if issasl && saslClient != nil {
-// 		mech, ir, err := saslClient.Start()
-// 		if err != nil {
-// 			return nil, err
-// 		}
-// 		if _, err := con.sendMessage(START, []byte(mech)); err != nil {
-// 			return nil, err
-// 		}
-
-// 		if _, err := con.sendMessage(OK, ir); err != nil {
-// 			return nil, err
-// 		}
-// 		for {
-// 			status, payload, err := con.recvMessage()
-// 			if err != nil {
-// 				return nil, err
-// 			}
-// 			if status != OK && status != COMPLETE {
-// 				return nil, errors.New(fmt.Sprintf("Bad status:%d %s", status, string(payload)))
-// 			}
-
-// 			if status == COMPLETE {
-// 				break
-// 			}
-
-// 			response, err := saslClient.Next(payload)
-// 			if err != nil {
-// 				return nil, err
-// 			}
-// 			con.sendMessage(OK, response)
-// 		}
-// 	}
-// 	// //-----------------------------------------------------------------
-
-// 	req.ClientProtocol = inf.TProtocolVersion_HIVE_CLI_SERVICE_PROTOCOL_V10
-
-// 	req.Username = &user
-// 	req.Password = &passwd
-// 	fmt.Println("%+v", *client)
-// 	fmt.Println("req")
-// 	fmt.Println(req)
-// 	session, err := client.OpenSession(req)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	con.thrift = client
-// 	con.options = options
-// 	con.session = session.SessionHandle
-// 	return con, nil
-// }
-
-// // Write writes data into local buffer, which will be processed on Flush() called
-// func (t *Connection) Write(data []byte) (int, error) {
-
-// 	return t.WriteBuffer.Write(data)
-// } // Read reads data from local buffer, will read a new data frame if needed.
-// func (t *Connection) Read(buf []byte) (int, error) {
-
-// 	n, err := t.ReadBuffer.Read(buf)
-// 	if n > 0 {
-// 		return n, err
-// 	}
-// 	t.ReadFrame()
-// 	return t.ReadBuffer.Read(buf)
-// }
-// func (t *Connection) Flush() error {
-// 	length := make([]byte, 4)
-// 	binary.BigEndian.PutUint32(length, uint32(t.WriteBuffer.Len()))
-
-// 	frame := make([]byte, 0)
-// 	frame = append(frame, length...)
-// 	frame = append(frame, t.WriteBuffer.Bytes()...)
-// 	_, err := t.TSocket.Write(frame)
-// 	if err == nil {
-// 		t.WriteBuffer = new(bytes.Buffer)
-// 		return nil
-// 	}
-// 	return err
-// }
-// func (t *Connection) ReadFrame() error {
-// 	header := make([]byte, 4)
-// 	_, err := t.TSocket.Read(header)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	length := int(binary.BigEndian.Uint32(header))
-// 	data := make([]byte, length)
-// 	_, err = t.TSocket.Read(data)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	_, err = t.ReadBuffer.Write(data)
-// 	return err
-// }
-
-func (c *Connection) isOpen() bool {
+func (c *SConnection) isOpen() bool {
 	return c.session != nil
 }
 
 // Closes an open hive session. After using this, the
 // Connection is invalid for other use.
-func (c *Connection) Close() error {
+func (c *SConnection) Close() error {
 	if c.isOpen() {
 		closeReq := inf.NewTCloseSessionReq()
 		closeReq.SessionHandle = c.session
@@ -264,7 +190,49 @@ func (c *Connection) Close() error {
 	return nil
 }
 
-func (c *Connection) ExecMode(query string, isAsync bool) (*inf.TOperationHandle, error) {
+// / sendMessage sends data length, status code and message body
+func (t *SConnection) sendMessage(status int, body []byte) (int, error) {
+	data := make([]byte, 0)
+	header1 := byte(status)
+	header2 := make([]byte, 4)
+	binary.BigEndian.PutUint32(header2, uint32(len(body)))
+
+	data = append(data, header1)
+	data = append(data, header2...)
+	data = append(data, body...)
+	n, err := t.TSocket.Write(data)
+	if err != nil {
+		return n, err
+	}
+	if err := t.TSocket.Flush(); err != nil {
+		return n, err
+	}
+
+	return n, nil
+}
+
+//------------------------------------------
+func (t *SConnection) recvMessage() (int, []byte, error) {
+	header := make([]byte, 5)
+	_, err := t.TSocket.Read(header)
+	if err != nil {
+		return -1, nil, err
+	}
+
+	status := int(header[0])
+	length := int(binary.BigEndian.Uint32(header[1:]))
+	var payload []byte
+	if length > 0 {
+		payload = make([]byte, length)
+		_, err := t.TSocket.Read(payload)
+		if err != nil {
+			return -1, nil, err
+		}
+	}
+	return status, payload, nil
+}
+
+func (c *SConnection) ExecMode(query string, isAsync bool) (*inf.TOperationHandle, error) {
 	executeReq := inf.NewTExecuteStatementReq()
 	executeReq.SessionHandle = c.session
 	executeReq.Statement = query
@@ -283,16 +251,11 @@ func (c *Connection) ExecMode(query string, isAsync bool) (*inf.TOperationHandle
 	return resp.OperationHandle, err
 }
 
-func (c *Connection) Exec(query string) (*inf.TOperationHandle, error) {
+func (c *SConnection) Exec(query string) (*inf.TOperationHandle, error) {
 	return c.ExecMode(query, false)
 }
 
-func isSuccessStatus(p *inf.TStatus) bool {
-	status := p.GetStatusCode()
-	return status == inf.TStatusCode_SUCCESS_STATUS || status == inf.TStatusCode_SUCCESS_WITH_INFO_STATUS
-}
-
-func (c *Connection) FetchOne(op *inf.TOperationHandle) (rows *inf.TRowSet, hasMoreRows bool, e error) {
+func (c *SConnection) FetchOne(op *inf.TOperationHandle) (rows *inf.TRowSet, hasMoreRows bool, e error) {
 	fetchReq := inf.NewTFetchResultsReq()
 	fetchReq.OperationHandle = op
 	fetchReq.Orientation = inf.TFetchOrientation_FETCH_NEXT
@@ -321,7 +284,7 @@ func (c *Connection) FetchOne(op *inf.TOperationHandle) (rows *inf.TRowSet, hasM
 	return rows, resp.GetHasMoreRows(), nil
 }
 
-func (c *Connection) GetMetadata(op *inf.TOperationHandle) (*inf.TTableSchema, error) {
+func (c *SConnection) GetMetadata(op *inf.TOperationHandle) (*inf.TTableSchema, error) {
 	req := inf.NewTGetResultSetMetadataReq()
 	req.OperationHandle = op
 
@@ -348,7 +311,7 @@ func (c *Connection) GetMetadata(op *inf.TOperationHandle) (*inf.TTableSchema, e
 	3. GetMetadata
 	4. Convert to map
 */
-func (c *Connection) SimpleQuery(sql string) (rets []map[string]interface{}, err error) {
+func (c *SConnection) SimpleQuery(sql string) (rets []map[string]interface{}, err error) {
 	operate, err := c.ExecMode(sql, true)
 	if err != nil {
 		return nil, err
@@ -444,7 +407,7 @@ func (c *Connection) SimpleQuery(sql string) (rets []map[string]interface{}, err
 }
 
 // Issue a thrift call to check for the job's current status.
-func (c *Connection) CheckStatus(operation *inf.TOperationHandle) (*Status, error) {
+func (c *SConnection) CheckStatus(operation *inf.TOperationHandle) (*Status, error) {
 
 	req := inf.NewTGetOperationStatusReq()
 	req.OperationHandle = operation
@@ -470,7 +433,7 @@ func (c *Connection) CheckStatus(operation *inf.TOperationHandle) (*Status, erro
 }
 
 // Wait until the job is complete, one way or another, returning Status and error.
-func (c *Connection) WaitForOk(operation *inf.TOperationHandle) (*Status, error) {
+func (c *SConnection) WaitForOk(operation *inf.TOperationHandle) (*Status, error) {
 	for {
 		status, err := c.CheckStatus(operation)
 
@@ -490,52 +453,6 @@ func (c *Connection) WaitForOk(operation *inf.TOperationHandle) (*Status, error)
 	return nil, errors.New("Cannot run here when wait for operation ok")
 }
 
-// Returns a string representation of operation status.
-func (s Status) String() string {
-	if s.state == nil {
-		return "unknown"
-	}
-	return s.state.String()
-}
-
-// Returns true if the job has completed or failed.
-func (s Status) IsComplete() bool {
-	if s.state == nil {
-		return false
-	}
-
-	switch *s.state {
-	case inf.TOperationState_FINISHED_STATE,
-		inf.TOperationState_CANCELED_STATE,
-		inf.TOperationState_CLOSED_STATE,
-		inf.TOperationState_ERROR_STATE:
-		return true
-	}
-
-	return false
-}
-
-// Returns true if the job compelted successfully.
-
-func (s Status) IsSuccess() bool {
-	if s.state == nil {
-		return false
-	}
-
-	return *s.state == inf.TOperationState_FINISHED_STATE
-}
-
-func DeserializeOp(handle []byte) (*inf.TOperationHandle, error) {
-	ser := thrift.NewTDeserializer()
-	var val inf.TOperationHandle
-
-	if err := ser.Read(&val, handle); err != nil {
-		return nil, err
-	}
-
-	return &val, nil
-}
-
 // func SerializeOp(operation *inf.TOperationHandle) ([]byte, error) {
 // 	ser := thrift.NewTSerializer()
 // 	return ser.Write(operation)
@@ -544,7 +461,7 @@ func DeserializeOp(handle []byte) (*inf.TOperationHandle, error) {
 /*
 	将返回数据转换成map
 */
-func (c *Connection) FormatRowsAsMap(rows *inf.TRowSet, schema *inf.TTableSchema) (rets []map[string]interface{}, err error) {
+func (c *SConnection) FormatRowsAsMap(rows *inf.TRowSet, schema *inf.TTableSchema) (rets []map[string]interface{}, err error) {
 	var colValues = make(map[string]interface{}, 0)
 	var rowLen int
 
@@ -596,7 +513,7 @@ func (c *Connection) FormatRowsAsMap(rows *inf.TRowSet, schema *inf.TTableSchema
 }
 
 /*将hive返回的数据转换成内容行 不使用reflect 不占用两份内存*/
-func (c *Connection) FormatRows(rows *inf.TRowSet, schema *inf.TTableSchema) (rets [][]string, err error) {
+func (c *SConnection) FormatRows(rows *inf.TRowSet, schema *inf.TTableSchema) (rets [][]string, err error) {
 	//var colValues = make(map[string]interface{}, 0)
 	var rowLen int
 	var colLen = len(rows.Columns)
@@ -741,7 +658,7 @@ func (c *Connection) FormatRows(rows *inf.TRowSet, schema *inf.TTableSchema) (re
 }
 
 /*返回格式化后的表头*/
-func (c *Connection) FormatHeads(schema *inf.TTableSchema) (outHead []string, err error) {
+func (c *SConnection) FormatHeads(schema *inf.TTableSchema) (outHead []string, err error) {
 	if schema == nil {
 		err = fmt.Errorf("schema is nil shen FormatHeads")
 		return
@@ -752,6 +669,6 @@ func (c *Connection) FormatHeads(schema *inf.TTableSchema) (outHead []string, er
 	return
 }
 
-func (c *Connection) GetOptions() *Options {
+func (c *SConnection) GetOptions() *Options {
 	return &c.options
 }
